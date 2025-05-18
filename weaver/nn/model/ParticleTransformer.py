@@ -691,6 +691,7 @@ class ParticleTransformerModU(nn.Module):
                                  rank_bit,
                                  same_oct], dim=-1)
                 u = torch.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
+                m2 = mask.squeeze(1)
                 m2 = mask.unsqueeze(2) * mask.unsqueeze(1)
                 u = u * m2.unsqueeze(-1)
 
