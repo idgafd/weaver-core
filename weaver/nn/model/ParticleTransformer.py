@@ -692,7 +692,7 @@ class ParticleTransformerModU(nn.Module):
                                  same_oct], dim=-1)
                 u = torch.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
                 m2 = mask.squeeze(1)
-                m2 = mask.unsqueeze(2) * mask.unsqueeze(1)
+                m2 = mask.unsqueeze(1) * mask.unsqueeze(2)
                 u = u * m2.unsqueeze(-1)
 
                 x_dense = x.permute(1, 2, 0).contiguous()  # (B, C, N)
