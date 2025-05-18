@@ -575,12 +575,15 @@ class ParticleTransformer(nn.Module):
 
 
 class ParticleTransformerModU(nn.Module):
-
+    """
+    ParticleTransformer with U-matrices attention bias.
+    This is a standalone implementation that includes U-matrices logic for particle attention.
+    """
     def __init__(self,
                  input_dim,
                  num_classes=None,
                  # network configurations
-                 pair_input_dim=4,
+                 pair_input_dim=7,  # Changed to 7: 1 (distance) + 6 (U features)
                  pair_extra_dim=0,
                  remove_self_pair=False,
                  use_pre_activation_pair=True,
@@ -648,13 +651,75 @@ class ParticleTransformerModU(nn.Module):
     @torch.jit.ignore
     def no_weight_decay(self):
         return {'cls_token', }
+        
+    def _build_u_matrices(self, v, mask):
+        """
+        Build the U matrices for attention bias.
+        
+        Args:
+            v: Particle 4-vectors (B, 4, P) [px, py, pz, energy]
+            mask: Padding mask (B, 1, P)
+            
+        Returns:
+            u: U matrices (B, N, N, 6)
+        """
+        E, PX, PY, PZ = v[:, 3], v[:, 0], v[:, 1], v[:, 2]
+        
+        # Calculate basic kinematic quantities
+        phi = torch.atan2(PY, PX)
+        pt = torch.sqrt(PX ** 2 + PY ** 2 + 1e-8)
+        eta = 0.5 * torch.log1p((2 * PZ) / (E - PZ).clamp(min=1e-6))
+        
+        # Calculate rank based on pt
+        rank = pt.argsort(dim=1).argsort(dim=1).float()
+        
+        # Calculate pairwise differences
+        dEta = eta.unsqueeze(2) - eta.unsqueeze(1)
+        dPhi = torch.atan2(torch.sin(phi.unsqueeze(2) - phi.unsqueeze(1)),
+                          torch.cos(phi.unsqueeze(2) - phi.unsqueeze(1)))
+        dR2 = dEta ** 2 + dPhi ** 2
+        
+        # Calculate ranking relationship
+        rank_bit = (rank.unsqueeze(2) < rank.unsqueeze(1)).float()
+        
+        # Calculate same octant relationship
+        same_oct = ((torch.sign(PX).unsqueeze(2) == torch.sign(PX).unsqueeze(1)) &
+                    (torch.sign(PY).unsqueeze(2) == torch.sign(PY).unsqueeze(1)) &
+                    (torch.sign(PZ).unsqueeze(2) == torch.sign(PZ).unsqueeze(1))).float()
+        
+        # Stack all features into U matrices
+        u = torch.stack([
+            dEta,
+            torch.sin(dPhi), torch.cos(dPhi),
+            dR2,
+            rank_bit,
+            same_oct
+        ], dim=-1)
+        
+        # Remove NaN/Inf values
+        u = torch.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Apply mask to zero out padding pairs
+        m2 = mask.unsqueeze(2) * mask.unsqueeze(1)
+        return u * m2.unsqueeze(-1)
 
     def forward(self, x, v=None, mask=None, uu=None, uu_idx=None):
+        """
+        Forward pass with U-matrices attention bias.
+        
+        Args:
+            x: Input features tensor (B, C, P)
+            v: Particle 4-vectors (B, 4, P) [px, py, pz, energy]
+            mask: Padding mask (B, 1, P)
+            uu: Optional additional pair-wise info (not used in U-mode)
+            uu_idx: Optional indices for sparse pair-wise info (not used in U-mode)
+            
+        Returns:
+            Model output
+        """
         # x: (N, C, P)
         # v: (N, 4, P) [px,py,pz,energy]
         # mask: (N, 1, P) -- real particle = 1, padded = 0
-        # for pytorch: uu (N, C', num_pairs), uu_idx (N, 2, num_pairs)
-        # for onnx: uu (N, C', P, P), uu_idx=None
 
         with torch.no_grad():
             if not self.for_inference:
@@ -666,60 +731,35 @@ class ParticleTransformerModU(nn.Module):
         with torch.cuda.amp.autocast(enabled=self.use_amp):
             # input embedding
             x = self.embed(x).masked_fill(~mask.permute(2, 0, 1), 0)  # (P, N, C)
-
+            
+            # Generate attention mask using U-matrices
             attn_mask = None
-            if v is not None and uu is None:
+            if v is not None and self.pair_embed is not None:
                 print('Run U Mode')
-                E, PX, PY, PZ = v[:, 3], v[:, 0], v[:, 1], v[:, 2]
-                phi = torch.atan2(PY, PX)
-                pt = torch.sqrt(PX ** 2 + PY ** 2 + 1e-8)
-                eta = 0.5 * torch.log1p((2 * PZ) / (E - PZ).clamp(min=1e-6))
-
-                rank = pt.argsort(dim=1).argsort(dim=1).float()
-                dEta = eta.unsqueeze(2) - eta.unsqueeze(1)
-                dPhi = torch.atan2(torch.sin(phi.unsqueeze(2) - phi.unsqueeze(1)),
-                                   torch.cos(phi.unsqueeze(2) - phi.unsqueeze(1)))
-                dR2 = dEta ** 2 + dPhi ** 2
-                rank_bit = (rank.unsqueeze(2) < rank.unsqueeze(1)).float()
-                same_oct = ((torch.sign(PX).unsqueeze(2) == torch.sign(PX).unsqueeze(1)) &
-                            (torch.sign(PY).unsqueeze(2) == torch.sign(PY).unsqueeze(1)) &
-                            (torch.sign(PZ).unsqueeze(2) == torch.sign(PZ).unsqueeze(1))).float()
-
-                u = torch.stack([dEta,
-                                 torch.sin(dPhi), torch.cos(dPhi),
-                                 dR2,
-                                 rank_bit,
-                                 same_oct], dim=-1)
-                u = torch.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
-                m2 = mask.squeeze(1)
-                m2 = mask.unsqueeze(1) * mask.unsqueeze(2)
-                u = u * m2.unsqueeze(-1)
-
+                
+                # Build the U matrices
+                u = self._build_u_matrices(v, mask.squeeze(1))
+                
+                # Create embedding features
                 x_dense = x.permute(1, 2, 0).contiguous()  # (B, C, N)
                 x_conv = x_dense.permute(0, 2, 1)          # (B, N, C)
                 v_dist = torch.cdist(x_conv, x_conv, p=2).unsqueeze(-1)  # (B, N, N, 1)
-
+                
+                # Concatenate distance and U features
                 pairwise_full = torch.cat([v_dist, u], dim=-1)  # (B, N, N, 7)
+                
+                # Generate attention bias
                 attn_bias = self.pair_embed(None, pairwise_full).view(-1, v.size(-1), v.size(-1))  # (B·H, N, N)
-
+                
+                # Add CLS token rows/columns to attention bias
                 BH, N, _ = attn_bias.shape
                 device = attn_bias.device
                 zeros_r = torch.zeros(BH, 1, N, device=device)
                 attn_bias = torch.cat([zeros_r, attn_bias], dim=1)
                 zeros_c = torch.zeros(BH, N + 1, 1, device=device)
                 attn_bias = torch.cat([zeros_c, attn_bias], dim=2)
+                
                 attn_mask = attn_bias
-
-            elif self.pair_embed is not None:
-                attn_mask = self.pair_embed(v, uu).view(-1, v.size(-1), v.size(-1))
-
-                # також додай CLS розширення:
-                BH, N, _ = attn_mask.shape
-                device = attn_mask.device
-                zeros_r = torch.zeros(BH, 1, N, device=device)
-                attn_mask = torch.cat([zeros_r, attn_mask], dim=1)
-                zeros_c = torch.zeros(BH, N + 1, 1, device=device)
-                attn_mask = torch.cat([zeros_c, attn_mask], dim=2)
 
             # transform
             for block in self.blocks:
@@ -738,7 +778,6 @@ class ParticleTransformerModU(nn.Module):
             output = self.fc(x_cls)
             if self.for_inference:
                 output = torch.softmax(output, dim=1)
-            # print('output:\n', output)
             return output
 
 
