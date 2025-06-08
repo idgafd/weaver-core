@@ -896,10 +896,10 @@ class ParticleTransformerModUv2(nn.Module):
     def _pt(self, px, py, eps=1e-8):
         return torch.sqrt(px ** 2 + py ** 2 + eps)
 
-    def _eta(self, E, pz, eps=1e-8):
+    def _eta(self, px, py, pz, eps=1e-8):
         """Improved pseudorapidity with better numerical stability"""
-        p = torch.sqrt(px**2 + py**2 + pz**2 + eps)
-        return torch.asinh(self._safe_divide(pz, torch.sqrt(px**2 + py**2 + eps)))
+        pt = torch.sqrt(px**2 + py**2 + eps)
+        return torch.asinh(self._safe_divide(pz, pt))
 
     def _mass(self, E, px, py, pz, eps=1e-8):
         """Invariant mass calculation"""
@@ -917,7 +917,7 @@ class ParticleTransformerModUv2(nn.Module):
         # Basic kinematics
         phi = self._phi(PX, PY)
         pt = self._pt(PX, PY)
-        eta = self._eta(E, PZ)
+        eta = self._eta(PX, PY, PZ)
         mass = self._mass(E, PX, PY, PZ)
         
         # Pairwise differences
