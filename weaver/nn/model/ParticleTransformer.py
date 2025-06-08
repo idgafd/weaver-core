@@ -770,6 +770,292 @@ class ParticleTransformerModU(nn.Module):
             return output
 
 
+class ParticleTransformerModUv2(nn.Module):
+    def __init__(self,
+                 input_dim,
+                 num_classes=None,
+                 # network configurations
+                 pair_input_dim=4,
+                 pair_extra_dim=0,
+                 remove_self_pair=False,
+                 use_pre_activation_pair=True,
+                 embed_dims=[128, 512, 128],
+                 pair_embed_dims=[64, 64, 64],
+                 num_heads=8,
+                 num_layers=8,
+                 num_cls_layers=2,
+                 block_params=None,
+                 cls_block_params={'dropout': 0, 'attn_dropout': 0, 'activation_dropout': 0},
+                 fc_params=[],
+                 activation='gelu',
+                 # misc
+                 trim=True,
+                 for_inference=False,
+                 use_amp=False,
+                 # attention enhancement params
+                 attn_bias_scale=1.0,
+                 learnable_temp=True,
+                 use_layerwise_attn=True,
+                 **kwargs) -> None:
+        super().__init__(**kwargs)
+
+        self.trimmer = SequenceTrimmer(enabled=trim and not for_inference)
+        self.for_inference = for_inference
+        self.use_amp = use_amp
+        self.attn_bias_scale = attn_bias_scale
+        self.use_layerwise_attn = use_layerwise_attn
+
+        embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
+        default_cfg = dict(embed_dim=embed_dim, num_heads=num_heads, ffn_ratio=4,
+                           dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
+                           add_bias_kv=False, activation=activation,
+                           scale_fc=True, scale_attn=True, scale_heads=True, scale_resids=True)
+
+        cfg_block = copy.deepcopy(default_cfg)
+        if block_params is not None:
+            cfg_block.update(block_params)
+
+        cfg_cls_block = copy.deepcopy(default_cfg)
+        if cls_block_params is not None:
+            cfg_cls_block.update(cls_block_params)
+
+        self.pair_extra_dim = pair_extra_dim
+        self.embed = Embed(input_dim, embed_dims, activation=activation) if len(embed_dims) > 0 else nn.Identity()
+        
+        # Enhanced attention bias network
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        
+        # Multi-scale physics features
+        physics_dim = 12  # Enhanced physics features
+        
+        if self.use_layerwise_attn:
+            # Layer-specific attention projections
+            self.physics_projections = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(physics_dim, 64),
+                    nn.LayerNorm(64),
+                    nn.GELU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(64, num_heads)
+                ) for _ in range(num_layers)
+            ])
+        else:
+            # Single shared projection
+            self.physics_projection = nn.Sequential(
+                nn.Linear(physics_dim, 64), 
+                nn.LayerNorm(64),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(64, num_heads)
+            )
+        
+        # Learnable temperature for attention scaling
+        if learnable_temp:
+            self.temperature = nn.Parameter(torch.ones(num_heads))
+        else:
+            self.register_buffer('temperature', torch.ones(num_heads))
+            
+        # Distance embedding for better spatial awareness
+        self.dist_embed = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.GELU(),
+            nn.Linear(16, num_heads)
+        )
+        
+        self.blocks = nn.ModuleList([Block(**cfg_block) for _ in range(num_layers)])
+        self.cls_blocks = nn.ModuleList([Block(**cfg_cls_block) for _ in range(num_cls_layers)])
+        self.norm = nn.LayerNorm(embed_dim)
+
+        if fc_params is not None:
+            fcs = []
+            in_dim = embed_dim
+            for out_dim, drop_rate in fc_params:
+                fcs.append(nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Dropout(drop_rate)))
+                in_dim = out_dim
+            fcs.append(nn.Linear(in_dim, num_classes))
+            self.fc = nn.Sequential(*fcs)
+        else:
+            self.fc = None
+
+        # init
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim), requires_grad=True)
+        trunc_normal_(self.cls_token, std=.02)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'cls_token', 'temperature'}
+        
+    def _safe_divide(self, a, b, eps=1e-8):
+        """Safe division avoiding NaN/Inf"""
+        return a / (b + eps)
+
+    def _phi(self, px, py):
+        return torch.atan2(py, px)
+
+    def _pt(self, px, py, eps=1e-8):
+        return torch.sqrt(px ** 2 + py ** 2 + eps)
+
+    def _eta(self, E, pz, eps=1e-8):
+        """Improved pseudorapidity with better numerical stability"""
+        p = torch.sqrt(px**2 + py**2 + pz**2 + eps)
+        return torch.asinh(self._safe_divide(pz, torch.sqrt(px**2 + py**2 + eps)))
+
+    def _mass(self, E, px, py, pz, eps=1e-8):
+        """Invariant mass calculation"""
+        return torch.sqrt(torch.clamp(E**2 - px**2 - py**2 - pz**2, min=eps))
+    
+    def _rapidity(self, E, pz, eps=1e-8):
+        """Rapidity calculation"""
+        return 0.5 * torch.log(self._safe_divide(E + pz, E - pz + eps))
+
+    def _build_enhanced_physics_features(self, E, PX, PY, PZ, mask):
+        """
+        Build enhanced physics-aware pairwise features
+        Returns: (B, N, N, 12) tensor with rich physics features
+        """
+        # Basic kinematics
+        phi = self._phi(PX, PY)
+        pt = self._pt(PX, PY)
+        eta = self._eta(E, PZ)
+        mass = self._mass(E, PX, PY, PZ)
+        
+        # Pairwise differences
+        dEta = eta.unsqueeze(3) - eta.unsqueeze(2)  # (B, 1, N, N)
+        dPhi = phi.unsqueeze(3) - phi.unsqueeze(2)
+        
+        # Proper phi difference handling
+        dPhi = torch.atan2(torch.sin(dPhi), torch.cos(dPhi))
+        
+        # Angular distance
+        dR = torch.sqrt(dEta**2 + dPhi**2 + 1e-8)
+        
+        # Energy and momentum ratios
+        E_ratio = self._safe_divide(E.unsqueeze(3), E.unsqueeze(2))
+        pt_ratio = self._safe_divide(pt.unsqueeze(3), pt.unsqueeze(2))
+        
+        # Minimum values (useful for jet physics)
+        pt_min = torch.minimum(pt.unsqueeze(3), pt.unsqueeze(2))
+        E_min = torch.minimum(E.unsqueeze(3), E.unsqueeze(2))
+        
+        # Ranking features
+        pt_rank = pt.argsort(dim=2).argsort(dim=2).float()
+        E_rank = E.argsort(dim=2).argsort(dim=2).float()
+        rank_diff = (pt_rank.unsqueeze(3) - pt_rank.unsqueeze(2)) / (pt.size(2) + 1e-8)
+        
+        # Azimuthal correlations
+        cos_dphi = torch.cos(dPhi)
+        sin_dphi = torch.sin(dPhi)
+        
+        # Combine all features
+        features = torch.stack([
+            dEta,           # 0: pseudorapidity difference
+            dPhi,           # 1: azimuthal angle difference  
+            dR,             # 2: angular distance
+            cos_dphi,       # 3: cosine of phi difference
+            sin_dphi,       # 4: sine of phi difference
+            torch.log(E_ratio + 1e-8),    # 5: log energy ratio
+            torch.log(pt_ratio + 1e-8),   # 6: log pt ratio
+            torch.log(pt_min * dR + 1e-8), # 7: log relative kt
+            rank_diff,      # 8: relative ranking
+            torch.tanh(dEta), # 9: bounded eta difference
+            torch.exp(-dR), # 10: proximity weight
+            torch.log(E_min + 1e-8)  # 11: log minimum energy
+        ], dim=-1)  # (B, 1, N, N, 12)
+        
+        # Clean up NaN/Inf and apply masking
+        features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Apply particle mask
+        pair_mask = mask.unsqueeze(3) * mask.unsqueeze(2)  # (B, 1, N, N)
+        features = features * pair_mask.unsqueeze(-1)
+        
+        return features.squeeze(1)  # (B, N, N, 12)
+
+    def _create_attention_bias(self, physics_features, euclidean_dist, layer_idx=0):
+        """
+        Create attention bias from physics features and euclidean distance
+        """
+        B, N, _, physics_dim = physics_features.shape
+        
+        # Project physics features to attention bias
+        if self.use_layerwise_attn:
+            physics_bias = self.physics_projections[layer_idx](
+                physics_features.view(B * N * N, physics_dim)
+            ).view(B, N, N, self.num_heads)
+        else:
+            physics_bias = self.physics_projection(
+                physics_features.view(B * N * N, physics_dim)
+            ).view(B, N, N, self.num_heads)
+        
+        # Distance embedding
+        dist_bias = self.dist_embed(euclidean_dist.unsqueeze(-1))  # (B, N, N, num_heads)
+        
+        # Combine biases
+        total_bias = physics_bias + dist_bias
+        
+        # Apply temperature scaling per head
+        total_bias = total_bias * self.temperature.view(1, 1, 1, -1) * self.attn_bias_scale
+        
+        # Rearrange for multi-head attention: (B * num_heads, N, N)
+        return total_bias.permute(0, 3, 1, 2).contiguous().view(B * self.num_heads, N, N)
+
+    def forward(self, x, v=None, mask=None, uu=None, uu_idx=None):
+        with torch.no_grad():
+            if not self.for_inference:
+                if uu_idx is not None:
+                    uu = build_sparse_tensor(uu, uu_idx, x.size(-1))
+            x, v, mask, uu = self.trimmer(x, v, mask, uu)
+            padding_mask = ~mask.squeeze(1)  # (N, P)
+
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            # Input embedding
+            x_emb = self.embed(x).masked_fill(~mask.permute(2, 0, 1), 0)  # (P, N, C)
+            
+            # Precompute physics features and distance if we have 4-momentum
+            physics_features = None
+            euclidean_dist = None
+            
+            if v is not None:
+                # Extract 4-momentum components: v is (N, 4, P) [px,py,pz,energy]
+                E = v[:, 3, :].unsqueeze(1)   # (N, 1, P)
+                PX = v[:, 0, :].unsqueeze(1)  # (N, 1, P)
+                PY = v[:, 1, :].unsqueeze(1)  # (N, 1, P)
+                PZ = v[:, 2, :].unsqueeze(1)  # (N, 1, P)
+                
+                # Build enhanced physics features
+                physics_features = self._build_enhanced_physics_features(E, PX, PY, PZ, mask)
+                
+                # Euclidean distance in 4-momentum space
+                v_reshaped = v.permute(0, 2, 1)  # (N, P, 4)
+                euclidean_dist = torch.cdist(v_reshaped, v_reshaped, p=2)  # (N, P, P)
+
+            # Transform through blocks with layer-specific attention
+            for layer_idx, block in enumerate(self.blocks):
+                attn_mask = None
+                if physics_features is not None:
+                    attn_mask = self._create_attention_bias(
+                        physics_features, euclidean_dist, layer_idx
+                    )
+                
+                x_emb = block(x_emb, x_cls=None, padding_mask=padding_mask, attn_mask=attn_mask)
+
+            # Extract class token
+            cls_tokens = self.cls_token.expand(1, x_emb.size(1), -1)  # (1, N, C)
+            for block in self.cls_blocks:
+                cls_tokens = block(x_emb, x_cls=cls_tokens, padding_mask=padding_mask)
+
+            x_cls = self.norm(cls_tokens).squeeze(0)
+
+            # Final classification
+            if self.fc is None:
+                return x_cls
+            output = self.fc(x_cls)
+            if self.for_inference:
+                output = torch.softmax(output, dim=1)
+            return output
+
+
 class ParticleTransformerTagger(nn.Module):
 
     def __init__(self,
