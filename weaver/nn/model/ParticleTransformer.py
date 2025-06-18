@@ -822,12 +822,10 @@ class ParticleTransformerModUv2(nn.Module):
         self.pair_extra_dim = pair_extra_dim
         self.embed = Embed(input_dim, embed_dims, activation=activation) if len(embed_dims) > 0 else nn.Identity()
         
-        # Enhanced attention bias network
         self.num_heads = num_heads
         self.num_layers = num_layers
         
-        # Multi-scale physics features
-        physics_dim = 12  # Enhanced physics features
+        physics_dim = 12
         
         if self.use_layerwise_attn:
             # Layer-specific attention projections
@@ -897,70 +895,55 @@ class ParticleTransformerModUv2(nn.Module):
         return torch.sqrt(px ** 2 + py ** 2 + eps)
 
     def _eta(self, px, py, pz, eps=1e-8):
-        """Improved pseudorapidity with better numerical stability"""
         pt = torch.sqrt(px**2 + py**2 + eps)
         return torch.asinh(self._safe_divide(pz, pt))
 
     def _mass(self, E, px, py, pz, eps=1e-8):
-        """Invariant mass calculation"""
         return torch.sqrt(torch.clamp(E**2 - px**2 - py**2 - pz**2, min=eps))
     
     def _rapidity(self, E, pz, eps=1e-8):
-        """Rapidity calculation"""
         return 0.5 * torch.log(self._safe_divide(E + pz, E - pz + eps))
 
     def _build_enhanced_physics_features(self, E, PX, PY, PZ, mask):
-        """
-        Build enhanced physics-aware pairwise features
-        Returns: (B, N, N, 12) tensor with rich physics features
-        """
         # Basic kinematics
         phi = self._phi(PX, PY)
         pt = self._pt(PX, PY)
         eta = self._eta(PX, PY, PZ)
         mass = self._mass(E, PX, PY, PZ)
         
-        # Pairwise differences
         dEta = eta.unsqueeze(3) - eta.unsqueeze(2)  # (B, 1, N, N)
         dPhi = phi.unsqueeze(3) - phi.unsqueeze(2)
         
-        # Proper phi difference handling
         dPhi = torch.atan2(torch.sin(dPhi), torch.cos(dPhi))
         
-        # Angular distance
         dR = torch.sqrt(dEta**2 + dPhi**2 + 1e-8)
         
-        # Energy and momentum ratios
         E_ratio = self._safe_divide(E.unsqueeze(3), E.unsqueeze(2))
         pt_ratio = self._safe_divide(pt.unsqueeze(3), pt.unsqueeze(2))
         
-        # Minimum values (useful for jet physics)
         pt_min = torch.minimum(pt.unsqueeze(3), pt.unsqueeze(2))
         E_min = torch.minimum(E.unsqueeze(3), E.unsqueeze(2))
         
-        # Ranking features
         pt_rank = pt.argsort(dim=2).argsort(dim=2).float()
         E_rank = E.argsort(dim=2).argsort(dim=2).float()
         rank_diff = (pt_rank.unsqueeze(3) - pt_rank.unsqueeze(2)) / (pt.size(2) + 1e-8)
         
-        # Azimuthal correlations
         cos_dphi = torch.cos(dPhi)
         sin_dphi = torch.sin(dPhi)
         
-        # Combine all features
         features = torch.stack([
-            dEta,           # 0: pseudorapidity difference
-            dPhi,           # 1: azimuthal angle difference  
-            dR,             # 2: angular distance
-            cos_dphi,       # 3: cosine of phi difference
-            sin_dphi,       # 4: sine of phi difference
-            torch.log(E_ratio + 1e-8),    # 5: log energy ratio
-            torch.log(pt_ratio + 1e-8),   # 6: log pt ratio
-            torch.log(pt_min * dR + 1e-8), # 7: log relative kt
-            rank_diff,      # 8: relative ranking
-            torch.tanh(dEta), # 9: bounded eta difference
-            torch.exp(-dR), # 10: proximity weight
-            torch.log(E_min + 1e-8)  # 11: log minimum energy
+            dEta,           # pseudorapidity difference
+            dPhi,           # azimuthal angle difference  
+            dR,             # angular distance
+            cos_dphi,       # cosine of phi difference
+            sin_dphi,       # sine of phi difference
+            torch.log(E_ratio + 1e-8),    # log energy ratio
+            torch.log(pt_ratio + 1e-8),   # log pt ratio
+            torch.log(pt_min * dR + 1e-8), # log relative kt
+            rank_diff,      # relative ranking
+            torch.tanh(dEta), # bounded eta difference
+            torch.exp(-dR), # proximity weight
+            torch.log(E_min + 1e-8)  # log minimum energy
         ], dim=-1)  # (B, 1, N, N, 12)
         
         # Clean up NaN/Inf and apply masking
@@ -973,9 +956,6 @@ class ParticleTransformerModUv2(nn.Module):
         return features.squeeze(1)  # (B, N, N, 12)
 
     def _create_attention_bias(self, physics_features, euclidean_dist, layer_idx=0):
-        """
-        Create attention bias from physics features and euclidean distance
-        """
         B, N, _, physics_dim = physics_features.shape
         
         # Project physics features to attention bias
@@ -988,16 +968,9 @@ class ParticleTransformerModUv2(nn.Module):
                 physics_features.view(B * N * N, physics_dim)
             ).view(B, N, N, self.num_heads)
         
-        # Distance embedding
         dist_bias = self.dist_embed(euclidean_dist.unsqueeze(-1))  # (B, N, N, num_heads)
-        
-        # Combine biases
         total_bias = physics_bias + dist_bias
-        
-        # Apply temperature scaling per head
         total_bias = total_bias * self.temperature.view(1, 1, 1, -1) * self.attn_bias_scale
-        
-        # Rearrange for multi-head attention: (B * num_heads, N, N)
         return total_bias.permute(0, 3, 1, 2).contiguous().view(B * self.num_heads, N, N)
 
     def forward(self, x, v=None, mask=None, uu=None, uu_idx=None):
@@ -1009,28 +982,22 @@ class ParticleTransformerModUv2(nn.Module):
             padding_mask = ~mask.squeeze(1)  # (N, P)
 
         with torch.cuda.amp.autocast(enabled=self.use_amp):
-            # Input embedding
             x_emb = self.embed(x).masked_fill(~mask.permute(2, 0, 1), 0)  # (P, N, C)
             
-            # Precompute physics features and distance if we have 4-momentum
             physics_features = None
             euclidean_dist = None
             
             if v is not None:
-                # Extract 4-momentum components: v is (N, 4, P) [px,py,pz,energy]
                 E = v[:, 3, :].unsqueeze(1)   # (N, 1, P)
                 PX = v[:, 0, :].unsqueeze(1)  # (N, 1, P)
                 PY = v[:, 1, :].unsqueeze(1)  # (N, 1, P)
                 PZ = v[:, 2, :].unsqueeze(1)  # (N, 1, P)
                 
-                # Build enhanced physics features
                 physics_features = self._build_enhanced_physics_features(E, PX, PY, PZ, mask)
                 
-                # Euclidean distance in 4-momentum space
                 v_reshaped = v.permute(0, 2, 1)  # (N, P, 4)
                 euclidean_dist = torch.cdist(v_reshaped, v_reshaped, p=2)  # (N, P, P)
 
-            # Transform through blocks with layer-specific attention
             for layer_idx, block in enumerate(self.blocks):
                 attn_mask = None
                 if physics_features is not None:
@@ -1040,14 +1007,12 @@ class ParticleTransformerModUv2(nn.Module):
                 
                 x_emb = block(x_emb, x_cls=None, padding_mask=padding_mask, attn_mask=attn_mask)
 
-            # Extract class token
             cls_tokens = self.cls_token.expand(1, x_emb.size(1), -1)  # (1, N, C)
             for block in self.cls_blocks:
                 cls_tokens = block(x_emb, x_cls=cls_tokens, padding_mask=padding_mask)
 
             x_cls = self.norm(cls_tokens).squeeze(0)
 
-            # Final classification
             if self.fc is None:
                 return x_cls
             output = self.fc(x_cls)
