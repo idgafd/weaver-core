@@ -574,7 +574,7 @@ class ParticleTransformer(nn.Module):
             return output
 
 
-class ParticleTransformerModU(nn.Module):
+class ParticleTransformerModUOld(nn.Module):
     def __init__(self,
                  input_dim,
                  num_classes=None,
@@ -770,6 +770,198 @@ class ParticleTransformerModU(nn.Module):
             return output
 
 
+class ParticleTransformerModU(nn.Module):
+    def __init__(self,
+                 input_dim,
+                 num_classes=None,
+                 # network configurations
+                 pair_input_dim=4,
+                 pair_extra_dim=0,
+                 remove_self_pair=False,
+                 use_pre_activation_pair=True,
+                 embed_dims=[128, 512, 128],
+                 pair_embed_dims=[64, 64, 64],
+                 num_heads=8,
+                 num_layers=8,
+                 num_cls_layers=2,
+                 block_params=None,
+                 cls_block_params={'dropout': 0, 'attn_dropout': 0, 'activation_dropout': 0},
+                 fc_params=[],
+                 activation='gelu',
+                 # misc
+                 trim=True,
+                 for_inference=False,
+                 use_amp=False,
+                 # hybrid parameters
+                 use_pair_embed=True,
+                 use_u_bias=True,
+                 **kwargs) -> None:
+        super().__init__(**kwargs)
+
+        self.trimmer = SequenceTrimmer(enabled=trim and not for_inference)
+        self.for_inference = for_inference
+        self.use_amp = use_amp
+        self.use_pair_embed = use_pair_embed
+        self.use_u_bias = use_u_bias
+
+        embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
+        default_cfg = dict(embed_dim=embed_dim, num_heads=num_heads, ffn_ratio=4,
+                           dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
+                           add_bias_kv=False, activation=activation,
+                           scale_fc=True, scale_attn=True, scale_heads=True, scale_resids=True)
+
+        cfg_block = copy.deepcopy(default_cfg)
+        if block_params is not None:
+            cfg_block.update(block_params)
+
+        cfg_cls_block = copy.deepcopy(default_cfg)
+        if cls_block_params is not None:
+            cfg_cls_block.update(cls_block_params)
+
+        self.pair_extra_dim = pair_extra_dim
+        self.embed = Embed(input_dim, embed_dims, activation=activation) if len(embed_dims) > 0 else nn.Identity()
+        
+        self.pair_embed = PairEmbed(
+            pair_input_dim, pair_extra_dim, pair_embed_dims + [cfg_block['num_heads']],
+            remove_self_pair=remove_self_pair, use_pre_activation_pair=use_pre_activation_pair,
+            for_onnx=for_inference) if (
+                self.use_pair_embed and 
+                pair_embed_dims is not None and 
+                pair_input_dim + pair_extra_dim > 0
+            ) else None
+        
+        self.num_heads = num_heads
+        self.u_projection = nn.Linear(7, num_heads) if self.use_u_bias else None
+        
+        if self.use_pair_embed and self.use_u_bias:
+            self.alpha = nn.Parameter(torch.tensor(0.5))  # balance weight
+        
+        self.blocks = nn.ModuleList([Block(**cfg_block) for _ in range(num_layers)])
+        self.cls_blocks = nn.ModuleList([Block(**cfg_cls_block) for _ in range(num_cls_layers)])
+        self.norm = nn.LayerNorm(embed_dim)
+
+        if fc_params is not None:
+            fcs = []
+            in_dim = embed_dim
+            for out_dim, drop_rate in fc_params:
+                fcs.append(nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Dropout(drop_rate)))
+                in_dim = out_dim
+            fcs.append(nn.Linear(in_dim, num_classes))
+            self.fc = nn.Sequential(*fcs)
+        else:
+            self.fc = None
+
+        # init
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim), requires_grad=True)
+        trunc_normal_(self.cls_token, std=.02)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'cls_token', }
+        
+    def _phi(self, px, py):
+        return torch.atan2(py, px)
+
+    def _pt(self, px, py):
+        return torch.sqrt(px ** 2 + py ** 2 + 1e-8)
+
+    def _eta(self, E, pz, eps=1e-6):
+        num = E + pz
+        den = E - pz
+        safe_ratio = torch.where(den > eps, num / (den + eps), torch.ones_like(den))
+        return 0.5 * torch.log(safe_ratio + eps)
+
+    def _build_u(self, E, PX, PY, PZ, mask):
+        phi = self._phi(PX, PY)
+        pt = self._pt(PX, PY)
+        eta = self._eta(E, PZ)
+
+        rank = pt.argsort(dim=2).argsort(dim=2).float()
+
+        dEta = eta.unsqueeze(3) - eta.unsqueeze(2)
+        dPhi = phi.unsqueeze(3) - phi.unsqueeze(2)
+        dPhi = torch.atan2(torch.sin(dPhi), torch.cos(dPhi))
+        dR2 = dEta**2 + dPhi**2
+        rank_bit = (rank.unsqueeze(3) < rank.unsqueeze(2)).float()
+
+        same_oct = (
+            (torch.sign(PX).unsqueeze(3) == torch.sign(PX).unsqueeze(2)) &
+            (torch.sign(PY).unsqueeze(3) == torch.sign(PY).unsqueeze(2)) &
+            (torch.sign(PZ).unsqueeze(3) == torch.sign(PZ).unsqueeze(2))
+        ).float()
+
+        u = torch.stack([dEta, torch.sin(dPhi), torch.cos(dPhi), dR2, rank_bit, same_oct], dim=-1)
+        u = torch.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
+        m2 = mask.unsqueeze(3) * mask.unsqueeze(2)
+        return u * m2.unsqueeze(-1)
+
+    def _compute_combined_attention_bias(self, v, mask, uu):
+        attention_biases = []
+        
+        if self.use_pair_embed and self.pair_embed is not None:
+            pair_bias = self.pair_embed(v, uu)  # (N, num_heads, P, P)
+            pair_bias = pair_bias.view(-1, v.size(-1), v.size(-1))  # (N*num_heads, P, P)
+            attention_biases.append(pair_bias)
+        
+        if self.use_u_bias and self.u_projection is not None and v is not None:
+            # Extract components
+            E = v[:, 3, :].unsqueeze(1)
+            PX = v[:, 0, :].unsqueeze(1)
+            PY = v[:, 1, :].unsqueeze(1)
+            PZ = v[:, 2, :].unsqueeze(1)
+            
+            u = self._build_u(E, PX, PY, PZ, mask)  # (N, 1, P, P, 6)
+            
+            v_reshaped = v.permute(0, 2, 1)  # (N, P, 4)
+            v_dist = torch.cdist(v_reshaped, v_reshaped, p=2).unsqueeze(-1)  # (N, P, P, 1)
+            
+            u_features = torch.cat([v_dist, u.squeeze(1)], dim=-1)  # (N, P, P, 7)
+            B, P, _, _ = u_features.shape
+            u_features_flat = u_features.view(B, P*P, -1)  # (N, P*P, 7)
+            u_bias = self.u_projection(u_features_flat)  # (N, P*P, num_heads)
+            u_bias = u_bias.permute(0, 2, 1).contiguous().view(B*self.num_heads, P, P)
+            attention_biases.append(u_bias)
+        
+        if len(attention_biases) == 2:
+            alpha = torch.sigmoid(self.alpha)  # ∈ [0, 1]
+            return alpha * attention_biases[0] + (1 - alpha) * attention_biases[1]
+        elif len(attention_biases) == 1:
+            return attention_biases[0]
+        else:
+            return None
+
+    def forward(self, x, v=None, mask=None, uu=None, uu_idx=None):
+        with torch.no_grad():
+            if not self.for_inference:
+                if uu_idx is not None:
+                    uu = build_sparse_tensor(uu, uu_idx, x.size(-1))
+            x, v, mask, uu = self.trimmer(x, v, mask, uu)
+            padding_mask = ~mask.squeeze(1)  # (N, P)
+
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            x = self.embed(x).masked_fill(~mask.permute(2, 0, 1), 0)  # (P, N, C)
+            
+            attn_mask = None
+            if (v is not None or uu is not None):
+                attn_mask = self._compute_combined_attention_bias(v, mask, uu)
+
+            for block in self.blocks:
+                x = block(x, x_cls=None, padding_mask=padding_mask, attn_mask=attn_mask)
+
+            cls_tokens = self.cls_token.expand(1, x.size(1), -1)
+            for block in self.cls_blocks:
+                cls_tokens = block(x, x_cls=cls_tokens, padding_mask=padding_mask)
+
+            x_cls = self.norm(cls_tokens).squeeze(0)
+
+            if self.fc is None:
+                return x_cls
+            output = self.fc(x_cls)
+            if self.for_inference:
+                output = torch.softmax(output, dim=1)
+            return output
+
+
 class ParticleTransformerModUv2(nn.Module):
     def __init__(self,
                  input_dim,
@@ -839,7 +1031,6 @@ class ParticleTransformerModUv2(nn.Module):
                 ) for _ in range(num_layers)
             ])
         else:
-            # Single shared projection
             self.physics_projection = nn.Sequential(
                 nn.Linear(physics_dim, 64), 
                 nn.LayerNorm(64),
@@ -848,13 +1039,11 @@ class ParticleTransformerModUv2(nn.Module):
                 nn.Linear(64, num_heads)
             )
         
-        # Learnable temperature for attention scaling
         if learnable_temp:
             self.temperature = nn.Parameter(torch.ones(num_heads))
         else:
             self.register_buffer('temperature', torch.ones(num_heads))
             
-        # Distance embedding for better spatial awareness
         self.dist_embed = nn.Sequential(
             nn.Linear(1, 16),
             nn.GELU(),
@@ -876,7 +1065,6 @@ class ParticleTransformerModUv2(nn.Module):
         else:
             self.fc = None
 
-        # init
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim), requires_grad=True)
         trunc_normal_(self.cls_token, std=.02)
 
@@ -885,7 +1073,6 @@ class ParticleTransformerModUv2(nn.Module):
         return {'cls_token', 'temperature'}
         
     def _safe_divide(self, a, b, eps=1e-8):
-        """Safe division avoiding NaN/Inf"""
         return a / (b + eps)
 
     def _phi(self, px, py):
