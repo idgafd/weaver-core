@@ -574,7 +574,7 @@ class ParticleTransformer(nn.Module):
             return output
 
 
-class ParticleTransformerModUOld(nn.Module):
+class ParticleTransformerModU(nn.Module):
     def __init__(self,
                  input_dim,
                  num_classes=None,
@@ -770,7 +770,7 @@ class ParticleTransformerModUOld(nn.Module):
             return output
 
 
-class ParticleTransformerModU(nn.Module):
+class ParticleTransformerModUHybrid(nn.Module):
     def __init__(self,
                  input_dim,
                  num_classes=None,
@@ -962,7 +962,7 @@ class ParticleTransformerModU(nn.Module):
             return output
 
 
-class ParticleTransformerModUv2(nn.Module):
+class ParticleTransformerModULayerwise(nn.Module):
     def __init__(self,
                  input_dim,
                  num_classes=None,
@@ -980,11 +980,9 @@ class ParticleTransformerModUv2(nn.Module):
                  cls_block_params={'dropout': 0, 'attn_dropout': 0, 'activation_dropout': 0},
                  fc_params=[],
                  activation='gelu',
-                 # misc
                  trim=True,
                  for_inference=False,
                  use_amp=False,
-                 # attention enhancement params
                  attn_bias_scale=1.0,
                  learnable_temp=True,
                  use_layerwise_attn=True,
@@ -1092,7 +1090,6 @@ class ParticleTransformerModUv2(nn.Module):
         return 0.5 * torch.log(self._safe_divide(E + pz, E - pz + eps))
 
     def _build_enhanced_physics_features(self, E, PX, PY, PZ, mask):
-        # Basic kinematics
         phi = self._phi(PX, PY)
         pt = self._pt(PX, PY)
         eta = self._eta(PX, PY, PZ)
